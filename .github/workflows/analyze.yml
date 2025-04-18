@@ -8,6 +8,8 @@ jobs:
   analyze:
     if: github.event.issue.title == 'update dependencies'
     runs-on: ubuntu-latest
+    permissions:       # <--- 在这里添加 permissions 块
+      contents: write  # <--- 明确请求内容写入权限
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
