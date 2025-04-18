@@ -1,0 +1,245 @@
+name: Analyze Dependencies
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  analyze:
+    if: github.event.issue.title == 'update dependencies'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          npm install @octokit/rest d3 jsdom
+
+      - name: Create visualizations directory
+        run: mkdir -p visualizations
+
+      - name: Run dependency analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > analyze.js << 'EOL'
+          const { Octokit } = require('@octokit/rest');
+          const fs = require('fs');
+          const path = require('path');
+          const { JSDOM } = require('jsdom');
+          const d3 = require('d3');
+
+          // Setup GitHub client
+          const octokit = new Octokit({
+            auth: process.env.GITHUB_TOKEN
+          });
+
+          async function main() {
+            console.log('Starting dependency analysis...');
+            
+            // Create directory for visualizations if it doesn't exist
+            if (!fs.existsSync('visualizations')) {
+              fs.mkdirSync('visualizations');
+            }
+            
+            // Search for repositories in the facebook organization with "react" in their name
+            const repos = await searchRepos();
+            console.log(`Found ${repos.length} repositories to analyze`);
+            
+            // Get dependencies for each repository
+            const dependencies = await getDependencies(repos);
+            
+            // Generate visualization
+            generateVisualization(dependencies);
+            
+            console.log('Analysis complete!');
+          }
+
+          async function searchRepos() {
+            let repos = [];
+            let page = 1;
+            let hasMorePages = true;
+            
+            while (hasMorePages) {
+              const response = await octokit.search.repos({
+                q: 'org:facebook react in:name',
+                per_page: 100,
+                page: page
+              });
+              
+              repos = repos.concat(response.data.items);
+              
+              hasMorePages = response.data.items.length === 100;
+              page++;
+            }
+            
+            return repos;
+          }
+
+          async function getDependencies(repos) {
+            const dependencies = new Map();
+            
+            for (const repo of repos) {
+              try {
+                // Get package.json content if it exists
+                const packageJson = await getPackageJson(repo.owner.login, repo.name);
+                
+                if (packageJson) {
+                  const deps = {
+                    ...packageJson.dependencies || {},
+                    ...packageJson.devDependencies || {}
+                  };
+                  
+                  dependencies.set(repo.name, deps);
+                  console.log(`Processed ${repo.name}`);
+                }
+              } catch (error) {
+                console.error(`Error processing ${repo.name}: ${error.message}`);
+              }
+            }
+            
+            return dependencies;
+          }
+
+          async function getPackageJson(owner, repo) {
+            try {
+              const response = await octokit.repos.getContent({
+                owner,
+                repo,
+                path: 'package.json'
+              });
+              
+              const content = Buffer.from(response.data.content, 'base64').toString();
+              return JSON.parse(content);
+            } catch (error) {
+              if (error.status === 404) {
+                console.log(`No package.json found for ${owner}/${repo}`);
+                return null;
+              }
+              throw error;
+            }
+          }
+
+          function generateVisualization(dependencies) {
+            // Create nodes and links for the graph
+            const nodes = [];
+            const links = [];
+            
+            // Add all repositories as nodes
+            for (const [repoName] of dependencies) {
+              nodes.push({ id: repoName, group: 1 });
+            }
+            
+            // Add dependencies as links
+            for (const [repoName, deps] of dependencies) {
+              for (const depName in deps) {
+                // Check if this dependency is one of our repositories
+                if (dependencies.has(depName)) {
+                  links.push({
+                    source: repoName,
+                    target: depName,
+                    value: 1
+                  });
+                }
+              }
+            }
+            
+            // Generate SVG using D3
+            const { window } = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+            const document = window.document;
+            global.document = document;
+            
+            const width = 960;
+            const height = 600;
+            
+            const svg = d3.select(document.body)
+              .append('svg')
+              .attr('width', width)
+              .attr('height', height)
+              .attr('xmlns', 'http://www.w3.org/2000/svg');
+            
+            const simulation = d3.forceSimulation(nodes)
+              .force('link', d3.forceLink(links).id(d => d.id))
+              .force('charge', d3.forceManyBody().strength(-300))
+              .force('center', d3.forceCenter(width / 2, height / 2));
+            
+            const link = svg.append('g')
+              .selectAll('line')
+              .data(links)
+              .enter()
+              .append('line')
+              .attr('stroke', '#999')
+              .attr('stroke-opacity', 0.6)
+              .attr('stroke-width', d => Math.sqrt(d.value));
+            
+            const node = svg.append('g')
+              .selectAll('circle')
+              .data(nodes)
+              .enter()
+              .append('circle')
+              .attr('r', 5)
+              .attr('fill', '#69b3a2');
+            
+            // Add text labels
+            const text = svg.append('g')
+              .selectAll('text')
+              .data(nodes)
+              .enter()
+              .append('text')
+              .text(d => d.id)
+              .attr('font-size', '10px')
+              .attr('dx', 8)
+              .attr('dy', 3);
+            
+            // Manually position nodes in fixed positions
+            for (let i = 0; i < 100; i++) {
+              simulation.tick();
+            }
+            
+            // Update link positions
+            link
+              .attr('x1', d => d.source.x)
+              .attr('y1', d => d.source.y)
+              .attr('x2', d => d.target.x)
+              .attr('y2', d => d.target.y);
+            
+            // Update node positions
+            node
+              .attr('cx', d => d.x)
+              .attr('cy', d => d.y);
+            
+            // Update text positions
+            text
+              .attr('x', d => d.x)
+              .attr('y', d => d.y);
+            
+            // Save SVG file
+            const svgOutput = document.body.innerHTML;
+            fs.writeFileSync(path.join('visualizations', 'dependency-graph.svg'), svgOutput);
+            console.log('Dependency graph saved to visualizations/dependency-graph.svg');
+          }
+
+          main().catch(error => {
+            console.error('Error in dependency analysis:', error);
+            process.exit(1);
+          });
+          EOL
+          
+          node analyze.js
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+      - name: Commit and push changes
+        run: |
+          git add visualizations/
+          git commit -m "Update dependency graph visualization" -a || echo "No changes to commit"
+          git push
